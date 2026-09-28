@@ -1,0 +1,10 @@
+{
+  "smiles": "CCCS(=O)c1c(F)c(ccc1C(F)(F)F)C(=O)Nc2oc(C)nn2",
+  "cas": "2428458-82-4",
+  "MW": 379.33,
+  "formula": "C14H13F4N3O3S",
+  "vdW_volume_A3": 396.6,
+  "equiv_sphere_d_A": 9.12,
+  "r_gyr_est_A": 4.33,
+  "kinetic_d_est_A": 8.66
+}
