@@ -44,7 +44,7 @@ desc = {
 desc["MIN_PLD_A"] = max(10.0, 1.4 * desc["kinetic_d_est_A"])   # 孔喉: 扩散下限
 desc["MIN_LCD_A"] = 1.2 * desc["equiv_sphere_d_A"]             # 空腔: 容纳下限
 json.dump(desc, open(f"{OUT}/drug_descriptors.json","w"), indent=2)
-print(json.dumps({k: round(v,2) for k,v in desc.items()}, ensure_ascii=False, indent=1))
+print(json.dumps({k: (round(float(v), 2) if isinstance(v, (int, float)) else v) for k, v in desc.items()}, ensure_ascii=False, indent=1))
 
 with Chem.SDWriter(f"{OUT}/flusulfinam_3d.sdf") as w:
     w.write(mol)
