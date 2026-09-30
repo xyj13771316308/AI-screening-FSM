@@ -1,65 +1,89 @@
-# -*- coding: utf-8 -*-
-"""
-Step 1: MOF 结构库获取与清洗
-==============================
-三个来源互补：
-  A. QMOF   ~20k 量子精修 MOF (DFT 优化结构, 带 partial charges)   首选
-     https://github.com/arosen93/QMOF  (qmof_database.zip, CIF)
-  B. CoRE MOF 2019  ~14k 实验合成 MOF (已去除溶剂分子)             落地性验证
-     http://gregchung.github.io/CoRE-MOFs/
-  C. MP-MOF  ~25k 假设 MOF (pymatgen API)                          结构多样性
-用法: python step1_collect.py --source qmof --cif_dir ./cifs/qmof
-输出: data/mofs.parquet  (material_id, formula, structure(pmg), source)
-"""
-import os, glob, argparse
+# step1_collect.py
+import os
+import time
 import pandas as pd
-from pymatgen.core import Structure
+import socket
+import urllib3.util.connection as urllib3_cn
 
-def load_cifs(cif_dir: str, source: str) -> pd.DataFrame:
-    rows, bad = [], 0
-    for f in glob.glob(os.path.join(cif_dir, "**/*.cif"), recursive=True):
-        mid = source + "-" + os.path.basename(f).replace(".cif","").replace("_","-")
+def _force_ipv4():
+    return socket.AF_INET
+
+urllib3_cn.allowed_gai_family = _force_ipv4
+from mp_api.client import MPRester
+from pymatgen.io.cif import CifWriter
+
+# ===== 配置区 =====
+API_KEY = os.environ.get("MP_API_KEY")
+if not API_KEY:
+    raise RuntimeError("没找到 MP_API_KEY，请先: export MP_API_KEY=你的key")
+
+METALS = ["Zn", "Cu", "Zr", "Fe", "Co", "Ni", "Cr", "Al",
+          "Mg", "Cd", "Mn", "Ti", "V", "In", "Mo", "W"]
+
+LIMIT = 10
+MAX_RETRY = 5
+OUT = "data/mofs.parquet"
+# ===================
+
+os.makedirs("data", exist_ok=True)
+
+
+def search_with_retry(mpr, metal, limit):
+    for attempt in range(MAX_RETRY):
         try:
-            s = Structure.from_file(f)
-            # --- 清洗规则 ---
-            if len(s) > 3000:            continue   # 超大晶胞 GCMC 跑不动
-            if s.volume/len(s) < 5:      continue   # 过于致密, 无孔
-            if not s.is_ordered:                      # 无序占据→取最高占据
-                s = s.get_sorted_structure()
-            rows.append({"material_id": mid, "formula": s.composition.reduced_formula,
-                         "structure": s, "source": source, "n_sites": len(s)})
-        except Exception:
-            bad += 1
-    print(f"[{source}] loaded={len(rows)} skipped={bad}")
-    return pd.DataFrame(rows)
+            return mpr.materials.summary.search(
+                elements=[metal, "C", "O"],
+                fields=["material_id", "formula_pretty", "structure",
+                        "density", "volume"],
+                chunk_size=(limit or 1000),
+            )
+        except Exception as e:
+            wait = 5 * (attempt + 1)
+            print(f"    [retry {attempt+1}/{MAX_RETRY}] {type(e).__name__}, {wait}s 后重试...")
+            time.sleep(wait)
+    print(f"    [skip] {metal} 多次重试仍失败，跳过")
+    return []
 
-def fetch_mp_mofs(api_key: str) -> pd.DataFrame:
-    from pymatgen.ext.matproj import MPRester
-    rows = []
-    with MPRester(api_key) as mpr:
-        docs = mpr.materials.search(fields=["material_id","formula_pretty",
-                                            "density","structure","theoretical"])
-    for d in docs:
-        s = d.structure
-        rows.append({"material_id": "MP-"+d.material_id.split("-")[-1],
-                     "formula": d.formula_pretty, "structure": s,
-                     "source": "mp", "n_sites": len(s)})
-    return pd.DataFrame(rows)
 
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--source", choices=["qmof","core","mp","all"], default="qmof")
-    ap.add_argument("--cif_dir", default="./cifs/qmof")
-    ap.add_argument("--mp_key", default=os.environ.get("MP_API_KEY",""))
-    args = ap.parse_args()
+seen = {}
+skipped = 0
 
-    dfs = []
-    if args.source in ("qmof","core","all"):
-        dfs.append(load_cifs(args.cif_dir, args.source))
-    if args.source in ("mp","all") and args.mp_key:
-        dfs.append(fetch_mp_mofs(args.mp_key))
+for attempt in range(MAX_RETRY):
+    try:
+        mpr = MPRester(API_KEY)
+        break
+    except Exception as e:
+        wait = 10 * (attempt + 1)
+        print(f"[retry {attempt+1}/{MAX_RETRY}] 连接初始化失败: {type(e).__name__}, {wait}s 重试...")
+        time.sleep(wait)
+else:
+    raise SystemExit("无法连接 Materials Project API，请检查网络/代理后重试")
 
-    df = pd.concat(dfs).drop_duplicates("material_id")
-    os.makedirs("data", exist_ok=True)
-    df.to_parquet("data/mofs.parquet")
-    print(f"total MOFs: {len(df)}")
+with mpr:
+    for metal in METALS:
+        print(f"[mp] querying: elements=[{metal}, C, O] ...")
+        docs = search_with_retry(mpr, metal, LIMIT)
+        new = 0
+        for d in docs:
+            if d.material_id in seen:
+                continue
+            try:
+                cif_writer = CifWriter(d.structure)
+                seen[d.material_id] = {
+                    "id": d.material_id,
+                    "formula": d.formula_pretty,
+                    "metal": metal,
+                    "density": d.density,
+                    "volume": getattr(d, "volume", None),
+                    "cif": cif_writer.__str__(),
+                }
+                new += 1
+            except Exception as e:
+                skipped += 1
+                print(f"    [warn] {d.material_id} 结构转换失败: {e}")
+        print(f"    -> new={new}")
+
+df = pd.DataFrame(seen.values())
+df.to_parquet(OUT)
+print(f"[mp] loaded={len(df)} skipped={skipped} -> {OUT}")
+print(df["metal"].value_counts())
